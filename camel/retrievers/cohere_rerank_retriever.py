@@ -14,13 +14,13 @@
 import os
 from typing import Any, Dict, List, Optional
 
-from camel.retrievers import BaseRetriever
-from camel.utils import dependencies_required
+from camel.retrievers.base_rerank import BaseRerankRetriever
+from camel.utils import api_keys_required, dependencies_required
 
 DEFAULT_TOP_K_RESULTS = 1
 
 
-class CohereRerankRetriever(BaseRetriever):
+class CohereRerankRetriever(BaseRerankRetriever):
     r"""An implementation of the `BaseRetriever` using the `Cohere Re-ranking`
     model.
 
@@ -34,6 +34,7 @@ class CohereRerankRetriever(BaseRetriever):
     """
 
     @dependencies_required('cohere')
+    @api_keys_required([("api_key", 'COHERE_API_KEY')])
     def __init__(
         self,
         model_name: str = "rerank-multilingual-v2.0",

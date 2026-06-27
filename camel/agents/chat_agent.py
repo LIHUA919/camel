@@ -84,6 +84,7 @@ from camel.models import (
     ModelManager,
     ModelProcessingError,
 )
+from camel.models._utils import extract_thinking_from_content
 from camel.prompts import TextPrompt
 from camel.responses import ChatAgentResponse
 from camel.storages import JsonStorage
@@ -451,6 +452,12 @@ class ChatAgent(BaseAgent):
         step_timeout (Optional[float], optional): Timeout in seconds for the
             entire step operation. If None, no timeout is applied.
             (default: :obj:`None`)
+        on_request_usage (Optional[Callable[[Dict[str, Any]], Any]],
+            optional): Callback triggered after each LLM request completes.
+            Useful for real-time token metering within a single step loop.
+            The callback receives a payload with per-request usage and
+            cumulative step usage.
+            (default: :obj:`None`)
         stream_accumulate (Optional[bool], optional): When True, partial
             streaming updates return accumulated content. When False, partial
             updates return only the incremental delta (recommended).
@@ -506,6 +513,7 @@ class ChatAgent(BaseAgent):
         retry_attempts: int = 3,
         retry_delay: float = 1.0,
         step_timeout: Optional[float] = Constants.TIMEOUT_THRESHOLD,
+        on_request_usage: Optional[Callable[[Dict[str, Any]], Any]] = None,
         stream_accumulate: Optional[bool] = None,
         summary_window_ratio: float = 0.6,
     ) -> None:
@@ -618,6 +626,7 @@ class ChatAgent(BaseAgent):
         self.retry_attempts = max(1, retry_attempts)
         self.retry_delay = max(0.0, retry_delay)
         self.step_timeout = step_timeout
+        self.on_request_usage = on_request_usage
         self._context_utility: Optional[ContextUtility] = None
         self._context_summary_agent: Optional["ChatAgent"] = None
 
@@ -635,6 +644,9 @@ class ChatAgent(BaseAgent):
         r"""Resets the :obj:`ChatAgent` to its initial state."""
         self.terminated = False
         self.init_messages()
+        # Snapshot-clean cache is per-conversation state and must not survive
+        # agent reuse (e.g. pooled workers across different tasks).
+        self._tool_output_history.clear()
         for terminator in self.response_terminators:
             terminator.reset()
 
@@ -838,14 +850,69 @@ class ChatAgent(BaseAgent):
         r"""Set the agent memory.
 
         When setting a new memory, the system message is automatically
-        re-added to ensure it's not lost.
+        added after existing system messages, while preserving existing
+        memory data.
 
         Args:
             value (AgentMemory): The new agent memory to use.
         """
         self._memory = value
-        # Ensure the new memory has the system message
-        self.init_messages()
+
+        # Reset summary state for the new memory
+        self._reset_summary_state()
+
+        # Clear token cache for the new memory
+        context_creator = self.memory.get_context_creator()
+        if hasattr(context_creator, 'clear_cache'):
+            context_creator.clear_cache()
+
+        if self.system_message is None:
+            return
+
+        # Get existing records from new memory
+        existing_records = self.memory.retrieve()
+
+        # Fast path: empty memory, just write system message
+        if not existing_records:
+            self.memory.write_record(
+                MemoryRecord(
+                    message=self.system_message,
+                    role_at_backend=OpenAIBackendRole.SYSTEM,
+                    timestamp=time.time_ns() / 1_000_000_000,
+                    agent_id=self.agent_id,
+                )
+            )
+            return
+
+        # Separate system messages and other messages in one pass
+        existing_system_records = []
+        other_records = []
+        for r in existing_records:
+            if r.memory_record.role_at_backend == OpenAIBackendRole.SYSTEM:
+                existing_system_records.append(r.memory_record)
+            else:
+                other_records.append(r.memory_record)
+
+        # Clear and rewrite in correct order
+        self.memory.clear()
+
+        # 1. Write existing system messages first
+        if existing_system_records:
+            self.memory.write_records(existing_system_records)
+
+        # 2. Write current agent's system message
+        self.memory.write_record(
+            MemoryRecord(
+                message=self.system_message,
+                role_at_backend=OpenAIBackendRole.SYSTEM,
+                timestamp=time.time_ns() / 1_000_000_000,
+                agent_id=self.agent_id,
+            )
+        )
+
+        # 3. Write other records
+        if other_records:
+            self.memory.write_records(other_records)
 
     def set_context_utility(
         self, context_utility: Optional[ContextUtility]
@@ -1247,7 +1314,7 @@ class ChatAgent(BaseAgent):
 
         def save_quoted(match):
             quoted_parts.append(match.group(0))
-            return f'__QUOTED_{len(quoted_parts)-1}__'
+            return f'__QUOTED_{len(quoted_parts) - 1}__'
 
         line = re.sub(r'"[^"]*"', save_quoted, line)
         line = re.sub(r'\s*\[[^\]]+\]\s*', ' ', line)
@@ -1449,10 +1516,29 @@ class ChatAgent(BaseAgent):
                 return
 
             existing_records = storage.load()
+            existing_record_uuids = {
+                str(record.get("uuid"))
+                for record in existing_records
+                if record.get("uuid") is not None
+            }
+            matched_uuids = [
+                record_uuid
+                for record_uuid in entry.record_uuids
+                if record_uuid in existing_record_uuids
+            ]
+
+            if not matched_uuids:
+                # Record no longer exists in current memory (e.g. after reset).
+                # Skip rewriting to avoid injecting orphan tool messages.
+                entry.cached = True
+                entry.record_uuids = []
+                entry.record_timestamps = []
+                return
+
             updated_records = [
                 record
                 for record in existing_records
-                if record["uuid"] not in entry.record_uuids
+                if str(record.get("uuid")) not in matched_uuids
             ]
             new_record = MemoryRecord(
                 message=cleaned_message,
@@ -1733,6 +1819,7 @@ class ChatAgent(BaseAgent):
                     agent_id=f"{self.agent_id}_context_summarizer",
                     token_limit=self.token_limit,
                     summarize_threshold=None,
+                    on_request_usage=self.on_request_usage,
                 )
             else:
                 self._context_summary_agent.reset()
@@ -2026,6 +2113,7 @@ class ChatAgent(BaseAgent):
                     agent_id=f"{self.agent_id}_context_summarizer",
                     token_limit=self.token_limit,
                     summarize_threshold=None,
+                    on_request_usage=self.on_request_usage,
                 )
             else:
                 self._context_summary_agent.reset()
@@ -2171,6 +2259,7 @@ class ChatAgent(BaseAgent):
                     agent_id=f"{self.agent_id}_context_summarizer",
                     token_limit=self.token_limit,
                     summarize_threshold=None,
+                    on_request_usage=self.on_request_usage,
                 )
             else:
                 self._context_summary_agent.reset()
@@ -2561,7 +2650,10 @@ class ChatAgent(BaseAgent):
             return input_message, response_format, False
 
         # Check if tools are strict mode compatible
-        if self._check_tools_strict_compatibility():
+        if (
+            self._check_tools_strict_compatibility()
+            or self.model_backend.supports_tool_response_format
+        ):
             return input_message, response_format, False
 
         # Tools are not strict compatible, convert to prompt
@@ -2841,6 +2933,10 @@ class ChatAgent(BaseAgent):
         iteration_count: int = 0
         prev_num_openai_messages: int = 0
 
+        # Track if we've recorded tool calls for the current response
+        # to avoid duplicate assistant message recording
+        recorded_tool_calls = False
+
         while True:
             if self.pause_event is not None and not self.pause_event.is_set():
                 # Use efficient blocking wait for threading.Event
@@ -2878,6 +2974,12 @@ class ChatAgent(BaseAgent):
             self._update_token_usage_tracker(
                 step_token_usage, response.usage_dict
             )
+            self._emit_request_usage(
+                usage_dict=response.usage_dict,
+                step_usage=step_token_usage.copy(),
+                request_index=iteration_count,
+                response_id=response.response_id,
+            )
 
             # Update token cache from LLM response
             self._update_token_cache(response.usage_dict, len(openai_messages))
@@ -2894,8 +2996,12 @@ class ChatAgent(BaseAgent):
                     "termination_triggered",
                 )
 
+            # Reset flag for each iteration
+            recorded_tool_calls = False
+
             if tool_call_requests := response.tool_call_requests:
-                # Process all tool calls
+                # Separate internal and external tool calls
+                internal_tool_requests = []
                 for tool_call_request in tool_call_requests:
                     if (
                         tool_call_request.tool_name
@@ -2905,17 +3011,33 @@ class ChatAgent(BaseAgent):
                             external_tool_call_requests = []
                         external_tool_call_requests.append(tool_call_request)
                     else:
-                        if (
-                            self.pause_event is not None
-                            and not self.pause_event.is_set()
-                        ):
-                            if isinstance(self.pause_event, threading.Event):
-                                self.pause_event.wait()
-                            else:
-                                while not self.pause_event.is_set():
-                                    time.sleep(0.001)
-                        result = self._execute_tool(tool_call_request)
-                        tool_call_records.append(result)
+                        internal_tool_requests.append(tool_call_request)
+
+                # Record the assistant message with ALL tool calls (internal +
+                # external)
+                response_content = ""
+                if response.output_messages:
+                    response_content = (
+                        response.output_messages[0].content or ""
+                    )
+                self._record_assistant_tool_calls_from_requests(
+                    tool_call_requests, content=response_content
+                )
+                recorded_tool_calls = True
+
+                # Execute internal tools only
+                for tool_call_request in internal_tool_requests:
+                    if (
+                        self.pause_event is not None
+                        and not self.pause_event.is_set()
+                    ):
+                        if isinstance(self.pause_event, threading.Event):
+                            self.pause_event.wait()
+                        else:
+                            while not self.pause_event.is_set():
+                                time.sleep(0.001)
+                    result = self._execute_tool(tool_call_request)
+                    tool_call_records.append(result)
 
                 # If we found external tool calls, break the loop
                 if external_tool_call_requests:
@@ -2978,7 +3100,10 @@ class ChatAgent(BaseAgent):
                 response, original_response_format
             )
 
-        self._record_final_output(response.output_messages)
+        # Only record final output if we haven't already recorded tool calls
+        # for this response (to avoid duplicate assistant messages)
+        if not recorded_tool_calls:
+            self._record_final_output(response.output_messages)
 
         # Clean tool call messages from memory after response generation
         if self.prune_tool_calls_from_memory and tool_call_records:
@@ -3114,6 +3239,10 @@ class ChatAgent(BaseAgent):
         iteration_count: int = 0
         prev_num_openai_messages: int = 0
 
+        # Track if we've recorded tool calls for the current response
+        # to avoid duplicate assistant message recording
+        recorded_tool_calls = False
+
         while True:
             if self.pause_event is not None and not self.pause_event.is_set():
                 if isinstance(self.pause_event, asyncio.Event):
@@ -3150,6 +3279,12 @@ class ChatAgent(BaseAgent):
             self._update_token_usage_tracker(
                 step_token_usage, response.usage_dict
             )
+            await self._aemit_request_usage(
+                usage_dict=response.usage_dict,
+                step_usage=step_token_usage.copy(),
+                request_index=iteration_count,
+                response_id=response.response_id,
+            )
 
             # Update token cache from LLM response
             self._update_token_cache(response.usage_dict, len(openai_messages))
@@ -3166,8 +3301,12 @@ class ChatAgent(BaseAgent):
                     "termination_triggered",
                 )
 
+            # Reset flag for each iteration
+            recorded_tool_calls = False
+
             if tool_call_requests := response.tool_call_requests:
-                # Process all tool calls
+                # Separate internal and external tool calls
+                internal_tool_requests = []
                 for tool_call_request in tool_call_requests:
                     if (
                         tool_call_request.tool_name
@@ -3177,21 +3316,37 @@ class ChatAgent(BaseAgent):
                             external_tool_call_requests = []
                         external_tool_call_requests.append(tool_call_request)
                     else:
-                        if (
-                            self.pause_event is not None
-                            and not self.pause_event.is_set()
-                        ):
-                            if isinstance(self.pause_event, asyncio.Event):
-                                await self.pause_event.wait()
-                            elif isinstance(self.pause_event, threading.Event):
-                                loop = asyncio.get_event_loop()
-                                await loop.run_in_executor(
-                                    None, self.pause_event.wait
-                                )
-                        tool_call_record = await self._aexecute_tool(
-                            tool_call_request
-                        )
-                        tool_call_records.append(tool_call_record)
+                        internal_tool_requests.append(tool_call_request)
+
+                # Record the assistant message with ALL tool calls (internal +
+                # external) BEFORE executing any tools.
+                response_content = ""
+                if response.output_messages:
+                    response_content = (
+                        response.output_messages[0].content or ""
+                    )
+                self._record_assistant_tool_calls_from_requests(
+                    tool_call_requests, content=response_content
+                )
+                recorded_tool_calls = True
+
+                # Execute internal tools only
+                for tool_call_request in internal_tool_requests:
+                    if (
+                        self.pause_event is not None
+                        and not self.pause_event.is_set()
+                    ):
+                        if isinstance(self.pause_event, asyncio.Event):
+                            await self.pause_event.wait()
+                        elif isinstance(self.pause_event, threading.Event):
+                            loop = asyncio.get_event_loop()
+                            await loop.run_in_executor(
+                                None, self.pause_event.wait
+                            )
+                    tool_call_record = await self._aexecute_tool(
+                        tool_call_request
+                    )
+                    tool_call_records.append(tool_call_record)
 
                 # If we found an external tool call, break the loop
                 if external_tool_call_requests:
@@ -3253,7 +3408,10 @@ class ChatAgent(BaseAgent):
                 response, original_response_format
             )
 
-        self._record_final_output(response.output_messages)
+        # Only record final output if we haven't already recorded tool calls
+        # for this response (to avoid duplicate assistant messages)
+        if not recorded_tool_calls:
+            self._record_final_output(response.output_messages)
 
         # Clean tool call messages from memory after response generation
         if self.prune_tool_calls_from_memory and tool_call_records:
@@ -3291,6 +3449,83 @@ class ChatAgent(BaseAgent):
             usage_dict.get("completion_tokens") or 0
         )
         tracker["total_tokens"] += usage_dict.get("total_tokens") or 0
+
+    def _emit_request_usage(
+        self,
+        usage_dict: Dict[str, Any],
+        step_usage: Dict[str, int],
+        request_index: int,
+        response_id: str,
+    ) -> None:
+        if self.on_request_usage is None:
+            return
+
+        payload = self._build_request_usage_payload(
+            usage_dict=usage_dict,
+            step_usage=step_usage,
+            request_index=request_index,
+            response_id=response_id,
+        )
+        try:
+            callback_result = self.on_request_usage(payload)
+            if inspect.isawaitable(callback_result):
+                logger.warning(
+                    "on_request_usage returned awaitable in sync step. "
+                    "Use a sync callback for `step`, or use `astep`."
+                )
+                if inspect.iscoroutine(callback_result):
+                    callback_result.close()
+        except Exception as exc:
+            logger.warning(
+                f"on_request_usage callback failed at request "
+                f"{request_index}: {exc}"
+            )
+
+    async def _aemit_request_usage(
+        self,
+        usage_dict: Dict[str, Any],
+        step_usage: Dict[str, int],
+        request_index: int,
+        response_id: str,
+    ) -> None:
+        if self.on_request_usage is None:
+            return
+
+        payload = self._build_request_usage_payload(
+            usage_dict=usage_dict,
+            step_usage=step_usage,
+            request_index=request_index,
+            response_id=response_id,
+        )
+        try:
+            callback_result = self.on_request_usage(payload)
+            if inspect.isawaitable(callback_result):
+                await callback_result
+        except Exception as exc:
+            logger.warning(
+                f"on_request_usage callback failed at request "
+                f"{request_index}: {exc}"
+            )
+
+    def _build_request_usage_payload(
+        self,
+        usage_dict: Dict[str, Any],
+        step_usage: Dict[str, int],
+        request_index: int,
+        response_id: str,
+    ) -> Dict[str, Any]:
+        usage = usage_dict or {}
+        return {
+            "agent_id": self.agent_id,
+            "request_index": request_index,
+            "response_id": response_id,
+            "request_usage": {
+                "prompt_tokens": int(usage.get("prompt_tokens") or 0),
+                "completion_tokens": int(usage.get("completion_tokens") or 0),
+                "total_tokens": int(usage.get("total_tokens") or 0),
+            },
+            "step_usage": step_usage,
+        }
 
     def _convert_to_chatagent_response(
         self,
@@ -3918,8 +4153,11 @@ class ChatAgent(BaseAgent):
         mask_output: bool = False,
         extra_content: Optional[Dict[str, Any]] = None,
     ):
-        r"""Record the tool calling information in the memory, and return the
-        tool calling record.
+        r"""Record the tool result in the memory.
+
+        Note: The assistant message with tool_calls should be recorded BEFORE
+        calling this method (via _record_assistant_tool_calls_from_requests).
+        This method only records the tool result message.
 
         Args:
             func_name (str): The name of the tool function called.
@@ -3944,16 +4182,9 @@ class ChatAgent(BaseAgent):
         )
         result_for_memory = truncated_result if was_truncated else result
 
-        assist_msg = FunctionCallingMessage(
-            role_name=self.role_name,
-            role_type=self.role_type,
-            meta_dict=None,
-            content="",
-            func_name=func_name,
-            args=args,
-            tool_call_id=tool_call_id,
-            extra_content=extra_content,
-        )
+        # Create the tool response message
+        # Note: assistant message with tool_calls is already recorded by
+        # _record_assistant_tool_calls_from_requests
         func_msg = FunctionCallingMessage(
             role_name=self.role_name,
             role_type=self.role_type,
@@ -3966,25 +4197,10 @@ class ChatAgent(BaseAgent):
             extra_content=extra_content,
         )
 
-        # Use precise timestamps to ensure correct ordering
-        # This ensures the assistant message (tool call) always appears before
-        # the function message (tool result) in the conversation context
-        # Use time.time_ns() for nanosecond precision to avoid collisions
-        current_time_ns = time.time_ns()
-        base_timestamp = current_time_ns / 1_000_000_000  # Convert to seconds
-
-        self.update_memory(
-            assist_msg,
-            OpenAIBackendRole.ASSISTANT,
-            timestamp=base_timestamp,
-            return_records=self._enable_snapshot_clean,
-        )
-
-        # Add minimal increment to ensure function message comes after
+        # Record only the tool result message
         func_records = self.update_memory(
             func_msg,
             OpenAIBackendRole.FUNCTION,
-            timestamp=base_timestamp + 1e-6,
             return_records=self._enable_snapshot_clean,
         )
 
@@ -3998,64 +4214,11 @@ class ChatAgent(BaseAgent):
                 cast(List[MemoryRecord], func_records),
             )
 
+        # Extract and inject images if result is ToolResult
+        images = None
         if isinstance(result, ToolResult) and result.images:
-            try:
-                import base64
-                import io
-
-                try:
-                    from PIL import Image
-                except ImportError:
-                    logger.warning(
-                        f"Tool '{func_name}' returned images but PIL "
-                        "is not installed. Install with: pip install "
-                        "Pillow. Skipping visual context injection."
-                    )
-                    # Continue without injecting images
-                    result = (
-                        result.text if hasattr(result, 'text') else str(result)
-                    )
-                else:
-                    logger.info(
-                        f"Tool '{func_name}' returned ToolResult with "
-                        f"{len(result.images)} image(s), injecting into "
-                        "context"
-                    )
-
-                    # Convert base64 images to PIL Image objects
-                    pil_images: List[Union[Image.Image, str]] = []
-                    for img_data in result.images:
-                        if img_data.startswith('data:image/'):
-                            # Extract base64 data
-                            base64_str = img_data.split(',', 1)[1]
-                            img_bytes = base64.b64decode(base64_str)
-                            pil_img = Image.open(io.BytesIO(img_bytes))
-                            pil_images.append(pil_img)
-
-                    if pil_images:
-                        # Create a user message with the image(s)
-                        visual_msg = BaseMessage.make_user_message(
-                            role_name="Tool",
-                            content=f"[Visual output from {func_name}]",
-                            image_list=pil_images,
-                        )
-
-                        # Inject into conversation context with slight
-                        # timestamp increment
-                        self.update_memory(
-                            visual_msg,
-                            OpenAIBackendRole.USER,
-                            timestamp=base_timestamp + 2e-6,
-                            return_records=False,
-                        )
-                        logger.info(
-                            f"Successfully injected {len(pil_images)} "
-                            "image(s) into agent context"
-                        )
-            except Exception as e:
-                logger.error(
-                    f"Failed to inject visual content from {func_name}: {e}"
-                )
+            images = result.images
+            self._inject_tool_images_into_memory(func_name, result.images)
 
         # Record information about this tool call
         # Note: tool_record contains the original result for the caller,
@@ -4065,9 +4228,66 @@ class ChatAgent(BaseAgent):
             args=args,
             result=result,
             tool_call_id=tool_call_id,
+            images=images,
         )
         self._update_last_tool_call_state(tool_record)
         return tool_record
+
+    def _inject_tool_images_into_memory(
+        self, func_name: str, image_list: List[str]
+    ) -> None:
+        r"""Inject images from a tool result into agent memory.
+
+        Args:
+            func_name (str): The name of the tool that returned images.
+            image_list (List[str]): List of base64-encoded image strings.
+        """
+        try:
+            import base64
+            import io
+
+            try:
+                from PIL import Image
+            except ImportError:
+                logger.warning(
+                    f"Tool '{func_name}' returned images but PIL "
+                    "is not installed. Install with: pip install "
+                    "Pillow. Skipping visual context injection."
+                )
+                return
+
+            logger.info(
+                f"Tool '{func_name}' returned ToolResult with "
+                f"{len(image_list)} image(s), injecting into context"
+            )
+
+            pil_images: List[Union[Image.Image, str]] = []
+            for img_data in image_list:
+                if img_data.startswith('data:image/'):
+                    base64_str = img_data.split(',', 1)[1]
+                    img_bytes = base64.b64decode(base64_str)
+                    pil_img = Image.open(io.BytesIO(img_bytes))
+                    pil_images.append(pil_img)
+
+            if pil_images:
+                visual_msg = BaseMessage.make_user_message(
+                    role_name="Tool",
+                    content=f"[Visual output from {func_name}]",
+                    image_list=pil_images,
+                )
+                self.update_memory(
+                    visual_msg,
+                    OpenAIBackendRole.USER,
+                    return_records=False,
+                )
+                logger.info(
+                    f"Successfully injected {len(pil_images)} "
+                    "image(s) into agent context"
+                )
+        except Exception as e:
+            logger.error(
+                f"Failed to inject visual content from {func_name}: {e}"
+            )
 
     def _stream(
         self,
@@ -4088,6 +4308,13 @@ class ChatAgent(BaseAgent):
                 content, tool calls, and other information as they become
                 available.
         """
+        # Handle response format compatibility with non-strict tools
+        input_message, response_format, _ = (
+            self._handle_response_format_with_non_strict_tools(
+                input_message, response_format
+            )
+        )
+
         # Convert input message to BaseMessage if necessary
         if isinstance(input_message, str):
             input_message = BaseMessage.make_user_message(
@@ -4196,20 +4423,28 @@ class ChatAgent(BaseAgent):
                 or (
                     hasattr(response, '__iter__')
                     and hasattr(response, '__enter__')
-                    and not hasattr(response, 'get_final_completion')
                     and not isinstance(response, ChatCompletion)
                 )
             ):
+                request_token_usage = self._create_token_usage_tracker()
                 (
                     stream_completed,
                     tool_calls_complete,
+                    request_response_id,
                 ) = yield from self._process_stream_chunks_with_accumulator(
                     response,  # type: ignore[arg-type]
                     content_accumulator,
                     accumulated_tool_calls,
                     tool_call_records,
+                    request_token_usage,
                     step_token_usage,
                     response_format,
+                )
+                self._emit_request_usage(
+                    usage_dict=request_token_usage,
+                    step_usage=step_token_usage.copy(),
+                    request_index=iteration_count,
+                    response_id=request_response_id,
                 )
 
                 if tool_calls_complete:
@@ -4243,8 +4478,12 @@ class ChatAgent(BaseAgent):
                     # Stream completed without tool calls
                     accumulated_tool_calls.clear()
                     break
-            elif hasattr(response, 'get_final_completion'):
+            elif hasattr(response, '__enter__') and not hasattr(
+                response, '__iter__'
+            ):
+                request_token_usage = self._create_token_usage_tracker()
                 # Handle structured output stream (ChatCompletionStreamManager)
+                # This catches context managers that aren't iterators
                 with response as stream:  # type: ignore[union-attr]
                     parsed_object = None
 
@@ -4299,17 +4538,27 @@ class ChatAgent(BaseAgent):
 
                         self.record_message(final_message)
 
-                        # Create final response
+                        request_usage = (
+                            safe_model_dump(final_completion.usage)
+                            if final_completion.usage
+                            else {}
+                        )
+                        self._update_token_usage_tracker(
+                            request_token_usage,
+                            request_usage,
+                        )
+                        self._update_token_usage_tracker(
+                            step_token_usage,
+                            request_usage,
+                        )
+
+                        # Create final response with cumulative step usage.
                         final_response = ChatAgentResponse(
                             msgs=[final_message],
                             terminated=False,
                             info={
                                 "id": final_completion.id or "",
-                                "usage": safe_model_dump(
-                                    final_completion.usage
-                                )
-                                if final_completion.usage
-                                else {},
+                                "usage": step_token_usage.copy(),
                                 "finish_reasons": [
                                     choice.finish_reason or "stop"
                                     for choice in final_completion.choices
@@ -4321,7 +4570,16 @@ class ChatAgent(BaseAgent):
                                 "external_tool_requests": None,
                                 "streaming": False,
                                 "partial": False,
+                                "stream_accumulate_mode": "accumulate"
+                                if self.stream_accumulate
+                                else "delta",
                             },
+                        )
+                        self._emit_request_usage(
+                            usage_dict=request_token_usage,
+                            step_usage=step_token_usage.copy(),
+                            request_index=iteration_count,
+                            response_id=final_completion.id or "",
                         )
                         yield final_response
                         break
@@ -4337,14 +4595,23 @@ class ChatAgent(BaseAgent):
                 model_response = self._handle_batch_response(
                     response  # type: ignore[arg-type]
                 )
+                self._update_token_usage_tracker(
+                    step_token_usage, model_response.usage_dict
+                )
+                self._emit_request_usage(
+                    usage_dict=model_response.usage_dict,
+                    step_usage=step_token_usage.copy(),
+                    request_index=iteration_count,
+                    response_id=model_response.response_id,
+                )
                 yield self._convert_to_chatagent_response(
                     model_response,
                     tool_call_records,
                     num_tokens,
                     None,
-                    model_response.usage_dict.get("prompt_tokens", 0),
-                    model_response.usage_dict.get("completion_tokens", 0),
-                    model_response.usage_dict.get("total_tokens", 0),
+                    step_token_usage["prompt_tokens"],
+                    step_token_usage["completion_tokens"],
+                    step_token_usage["total_tokens"],
                 )
                 accumulated_tool_calls.clear()
                 break
@@ -4355,15 +4622,18 @@ class ChatAgent(BaseAgent):
         content_accumulator: StreamContentAccumulator,
         accumulated_tool_calls: Dict[str, Any],
         tool_call_records: List[ToolCallingRecord],
+        request_token_usage: Dict[str, int],
         step_token_usage: Dict[str, int],
         response_format: Optional[Type[BaseModel]] = None,
-    ) -> Generator[ChatAgentResponse, None, Tuple[bool, bool]]:
+    ) -> Generator[ChatAgentResponse, None, Tuple[bool, bool, str]]:
         r"""Process streaming chunks with content accumulator."""
 
         tool_calls_complete = False
         stream_completed = False
+        last_response_id = ""
 
         for chunk in stream:
+            last_response_id = getattr(chunk, 'id', '') or last_response_id
             has_choices = bool(chunk.choices and len(chunk.choices) > 0)
 
             # Process chunk delta
@@ -4442,6 +4712,16 @@ class ChatAgent(BaseAgent):
                             content_accumulator.get_full_reasoning_content()
                             or None
                         )
+
+                        # Extract <think> tags from accumulated
+                        # streaming content when reasoning_content
+                        # is not already set by the model.
+                        final_content, final_reasoning = (
+                            extract_thinking_from_content(
+                                final_content, final_reasoning
+                            )
+                        )
+
                         final_message = BaseMessage(
                             role_name=self.role_name,
                             role_type=self.role_type,
@@ -4461,6 +4741,9 @@ class ChatAgent(BaseAgent):
                 # This happens when stream_options={"include_usage": True}
                 # Update the final usage from this chunk
                 self._update_token_usage_tracker(
+                    request_token_usage, safe_model_dump(chunk.usage)
+                )
+                self._update_token_usage_tracker(
                     step_token_usage, safe_model_dump(chunk.usage)
                 )
 
@@ -4473,6 +4756,16 @@ class ChatAgent(BaseAgent):
                             content_accumulator.get_full_reasoning_content()
                             or None
                         )
+
+                        # Extract <think> tags from accumulated
+                        # streaming content when reasoning_content
+                        # is not already set by the model.
+                        final_content, final_reasoning = (
+                            extract_thinking_from_content(
+                                final_content, final_reasoning
+                            )
+                        )
+
                         # In delta mode, final response content should be empty
                         # since all content was already yielded incrementally
                         display_content = (
@@ -4509,6 +4802,9 @@ class ChatAgent(BaseAgent):
                                 "external_tool_requests": None,
                                 "streaming": False,
                                 "partial": False,
+                                "stream_accumulate_mode": "accumulate"
+                                if self.stream_accumulate
+                                else "delta",
                             },
                         )
                         yield final_response
@@ -4518,7 +4814,7 @@ class ChatAgent(BaseAgent):
                 # consuming remaining chunks to capture final metadata.
                 continue
 
-        return stream_completed, tool_calls_complete
+        return stream_completed, tool_calls_complete, last_response_id
 
     def _accumulate_tool_calls(
         self,
@@ -4663,6 +4959,9 @@ class ChatAgent(BaseAgent):
             return
             yield  # Make this a generator
 
+        # Record the assistant message with ALL tool calls
+        self._record_assistant_tool_calls_message(accumulated_tool_calls)
+
         # Execute tools using ThreadPoolExecutor for proper timeout handling
         # Use max_workers=len() for parallel execution, with min of 1
         with concurrent.futures.ThreadPoolExecutor(
@@ -4722,7 +5021,12 @@ class ChatAgent(BaseAgent):
     def _execute_tool_from_stream_data(
         self, tool_call_data: Dict[str, Any]
     ) -> Optional[ToolCallingRecord]:
-        r"""Execute a tool from accumulated stream data."""
+        r"""Execute a tool from accumulated stream data.
+
+        Note: The assistant message with tool_calls should be recorded BEFORE
+        calling this method (via _record_assistant_tool_calls_message).
+        This method only records the tool result message.
+        """
 
         try:
             function_name = tool_call_data['function']['name']
@@ -4755,20 +5059,9 @@ class ChatAgent(BaseAgent):
                         truncated_result if was_truncated else result
                     )
 
-                    # First, create and record the assistant message with tool
-                    # call
-                    assist_msg = FunctionCallingMessage(
-                        role_name=self.role_name,
-                        role_type=self.role_type,
-                        meta_dict=None,
-                        content="",
-                        func_name=function_name,
-                        args=args,
-                        tool_call_id=tool_call_id,
-                        extra_content=extra_content,
-                    )
-
-                    # Then create the tool response message
+                    # Create the tool response message
+                    # Note: assistant message with tool_calls is already
+                    # recorded by _record_assistant_tool_calls_message
                     func_msg = FunctionCallingMessage(
                         role_name=self.role_name,
                         role_type=self.role_type,
@@ -4781,29 +5074,23 @@ class ChatAgent(BaseAgent):
                         extra_content=extra_content,
                     )
 
-                    # Record both messages with precise timestamps to ensure
-                    # correct ordering
-                    current_time_ns = time.time_ns()
-                    base_timestamp = (
-                        current_time_ns / 1_000_000_000
-                    )  # Convert to seconds
+                    # Record only the tool result message
+                    self.update_memory(func_msg, OpenAIBackendRole.FUNCTION)
 
-                    self.update_memory(
-                        assist_msg,
-                        OpenAIBackendRole.ASSISTANT,
-                        timestamp=base_timestamp,
-                    )
-                    self.update_memory(
-                        func_msg,
-                        OpenAIBackendRole.FUNCTION,
-                        timestamp=base_timestamp + 1e-6,
-                    )
+                    # Extract and inject images if result is ToolResult
+                    images = None
+                    if isinstance(result, ToolResult) and result.images:
+                        images = result.images
+                        self._inject_tool_images_into_memory(
+                            function_name, result.images
+                        )
 
                     tool_record = ToolCallingRecord(
                         tool_name=function_name,
                         args=args,
                         result=result,
                         tool_call_id=tool_call_id,
+                        images=images,
                     )
                     self._update_last_tool_call_state(tool_record)
                     return tool_record
@@ -4872,7 +5159,12 @@ class ChatAgent(BaseAgent):
     async def _aexecute_tool_from_stream_data(
         self, tool_call_data: Dict[str, Any]
     ) -> Optional[ToolCallingRecord]:
-        r"""Async execute a tool from accumulated stream data."""
+        r"""Async execute a tool from accumulated stream data.
+
+        Note: The assistant message with tool_calls should be recorded BEFORE
+        calling this method (via _record_assistant_tool_calls_message).
+        This method only records the tool result message.
+        """
 
         try:
             function_name = tool_call_data['function']['name']
@@ -4881,24 +5173,6 @@ class ChatAgent(BaseAgent):
             extra_content = tool_call_data.get('extra_content')
 
             if function_name in self._internal_tools:
-                # Create the tool call message
-                assist_msg = FunctionCallingMessage(
-                    role_name=self.role_name,
-                    role_type=self.role_type,
-                    meta_dict=None,
-                    content="",
-                    func_name=function_name,
-                    args=args,
-                    tool_call_id=tool_call_id,
-                    extra_content=extra_content,
-                )
-                assist_ts = time.time_ns() / 1_000_000_000
-                self.update_memory(
-                    assist_msg,
-                    OpenAIBackendRole.ASSISTANT,
-                    timestamp=assist_ts,
-                )
-
                 tool = self._internal_tools[function_name]
                 try:
                     # Try different invocation paths in order of preference
@@ -4953,6 +5227,8 @@ class ChatAgent(BaseAgent):
                     )
 
                     # Create the tool response message
+                    # Note: assistant message with tool_calls is already
+                    # recorded by _record_assistant_tool_calls_message
                     func_msg = FunctionCallingMessage(
                         role_name=self.role_name,
                         role_type=self.role_type,
@@ -4964,18 +5240,22 @@ class ChatAgent(BaseAgent):
                         mask_output=self.mask_tool_output,
                         extra_content=extra_content,
                     )
-                    func_ts = time.time_ns() / 1_000_000_000
-                    self.update_memory(
-                        func_msg,
-                        OpenAIBackendRole.FUNCTION,
-                        timestamp=func_ts,
-                    )
+                    self.update_memory(func_msg, OpenAIBackendRole.FUNCTION)
+
+                    # Extract and inject images if result is ToolResult
+                    images = None
+                    if isinstance(result, ToolResult) and result.images:
+                        images = result.images
+                        self._inject_tool_images_into_memory(
+                            function_name, result.images
+                        )
 
                     tool_record = ToolCallingRecord(
                         tool_name=function_name,
                         args=args,
                         result=result,
                         tool_call_id=tool_call_id,
+                        images=images,
                     )
                     self._update_last_tool_call_state(tool_record)
                     return tool_record
@@ -4998,12 +5278,7 @@ class ChatAgent(BaseAgent):
                         tool_call_id=tool_call_id,
                         extra_content=extra_content,
                     )
-                    func_ts = time.time_ns() / 1_000_000_000
-                    self.update_memory(
-                        func_msg,
-                        OpenAIBackendRole.FUNCTION,
-                        timestamp=func_ts,
-                    )
+                    self.update_memory(func_msg, OpenAIBackendRole.FUNCTION)
 
                     tool_record = ToolCallingRecord(
                         tool_name=function_name,
@@ -5160,12 +5435,13 @@ class ChatAgent(BaseAgent):
                 or (
                     hasattr(response, '__aiter__')
                     and hasattr(response, '__aenter__')
-                    and not hasattr(response, 'get_final_completion')
                     and not isinstance(response, ChatCompletion)
                 )
             ):
+                request_token_usage = self._create_token_usage_tracker()
                 stream_completed = False
                 tool_calls_complete = False
+                request_response_id = ""
 
                 # Process chunks and forward them
                 async for (
@@ -5175,17 +5451,28 @@ class ChatAgent(BaseAgent):
                     content_accumulator,
                     accumulated_tool_calls,
                     tool_call_records,
+                    request_token_usage,
                     step_token_usage,
                     response_format,
                 ):
                     if isinstance(item, tuple):
-                        # This is the final return value (stream_completed,
-                        # tool_calls_complete)
-                        stream_completed, tool_calls_complete = item
+                        # This is the final return value
+                        # (stream_completed, tool_calls_complete, response_id)
+                        (
+                            stream_completed,
+                            tool_calls_complete,
+                            request_response_id,
+                        ) = item
                         break
                     else:
                         # This is a ChatAgentResponse to be yielded
                         yield item
+                await self._aemit_request_usage(
+                    usage_dict=request_token_usage,
+                    step_usage=step_token_usage.copy(),
+                    request_index=iteration_count,
+                    response_id=request_response_id,
+                )
 
                 if tool_calls_complete:
                     # Clear completed tool calls
@@ -5218,9 +5505,13 @@ class ChatAgent(BaseAgent):
                     # Stream completed without tool calls
                     accumulated_tool_calls.clear()
                     break
-            elif hasattr(response, 'get_final_completion'):
+            elif hasattr(response, '__aenter__') and not hasattr(
+                response, '__aiter__'
+            ):
+                request_token_usage = self._create_token_usage_tracker()
                 # Handle structured output stream
                 # (AsyncChatCompletionStreamManager)
+                # Catches async context managers that aren't async iterators
                 async with response as stream:  # type: ignore[union-attr]
                     parsed_object = None
 
@@ -5275,17 +5566,27 @@ class ChatAgent(BaseAgent):
 
                         self.record_message(final_message)
 
-                        # Create final response
+                        request_usage = (
+                            safe_model_dump(final_completion.usage)
+                            if final_completion.usage
+                            else {}
+                        )
+                        self._update_token_usage_tracker(
+                            request_token_usage,
+                            request_usage,
+                        )
+                        self._update_token_usage_tracker(
+                            step_token_usage,
+                            request_usage,
+                        )
+
+                        # Create final response with cumulative step usage.
                         final_response = ChatAgentResponse(
                             msgs=[final_message],
                             terminated=False,
                             info={
                                 "id": final_completion.id or "",
-                                "usage": safe_model_dump(
-                                    final_completion.usage
-                                )
-                                if final_completion.usage
-                                else {},
+                                "usage": step_token_usage.copy(),
                                 "finish_reasons": [
                                     choice.finish_reason or "stop"
                                     for choice in final_completion.choices
@@ -5297,7 +5598,16 @@ class ChatAgent(BaseAgent):
                                 "external_tool_requests": None,
                                 "streaming": False,
                                 "partial": False,
+                                "stream_accumulate_mode": "accumulate"
+                                if self.stream_accumulate
+                                else "delta",
                             },
+                        )
+                        await self._aemit_request_usage(
+                            usage_dict=request_token_usage,
+                            step_usage=step_token_usage.copy(),
+                            request_index=iteration_count,
+                            response_id=final_completion.id or "",
                         )
                         yield final_response
                         break
@@ -5315,14 +5625,23 @@ class ChatAgent(BaseAgent):
                 model_response = self._handle_batch_response(
                     response  # type: ignore[arg-type]
                 )
+                self._update_token_usage_tracker(
+                    step_token_usage, model_response.usage_dict
+                )
+                await self._aemit_request_usage(
+                    usage_dict=model_response.usage_dict,
+                    step_usage=step_token_usage.copy(),
+                    request_index=iteration_count,
+                    response_id=model_response.response_id,
+                )
                 yield self._convert_to_chatagent_response(
                     model_response,
                     tool_call_records,
                     num_tokens,
                     None,
-                    model_response.usage_dict.get("prompt_tokens", 0),
-                    model_response.usage_dict.get("completion_tokens", 0),
-                    model_response.usage_dict.get("total_tokens", 0),
+                    step_token_usage["prompt_tokens"],
+                    step_token_usage["completion_tokens"],
+                    step_token_usage["total_tokens"],
                 )
                 accumulated_tool_calls.clear()
                 break
@@ -5338,7 +5657,10 @@ class ChatAgent(BaseAgent):
         # Create a BaseMessage with tool_calls information in meta_dict
         # This will be converted to the proper OpenAI format when needed
         tool_calls_list = []
-        for tool_call_data in accumulated_tool_calls.values():
+        for key, tool_call_data in accumulated_tool_calls.items():
+            # Skip internal mapping key
+            if key == '_index_to_key_map':
+                continue
             if tool_call_data.get('complete', False):
                 tool_call_dict = {
                     "id": tool_call_data["id"],
@@ -5355,7 +5677,56 @@ class ChatAgent(BaseAgent):
                     ]
                 tool_calls_list.append(tool_call_dict)
 
+        # Early return if no tool calls to record
+        if not tool_calls_list:
+            return
+
         # Create an assistant message with tool calls
+        assist_msg = BaseMessage(
+            role_name=self.role_name,
+            role_type=self.role_type,
+            meta_dict={"tool_calls": tool_calls_list},
+            content=content or "",
+        )
+
+        # Record this assistant message
+        self.update_memory(assist_msg, OpenAIBackendRole.ASSISTANT)
+
+    def _record_assistant_tool_calls_from_requests(
+        self, tool_call_requests: List["ToolCallRequest"], content: str = ""
+    ) -> None:
+        r"""Record assistant message with tool calls from requests.
+
+        This method creates and records an assistant message that includes
+        all the tool calls from a list of ToolCallRequest objects.
+        Used for non-streaming tool execution to ensure proper message
+        sequence.
+
+        Args:
+            tool_call_requests: List of tool call requests from model response.
+            content: Optional content to include in the assistant message.
+        """
+        import json
+
+        tool_calls_list = []
+        for request in tool_call_requests:
+            tool_call_dict = {
+                "id": request.tool_call_id,
+                "type": "function",
+                "function": {
+                    "name": request.tool_name,
+                    "arguments": json.dumps(request.args, ensure_ascii=False),
+                },
+            }
+            # Include extra_content if present
+            if request.extra_content:
+                tool_call_dict["extra_content"] = request.extra_content
+            tool_calls_list.append(tool_call_dict)
+
+        if not tool_calls_list:
+            return
+
+        # Create an assistant message with all tool calls
         assist_msg = BaseMessage(
             role_name=self.role_name,
             role_type=self.role_type,
@@ -5375,17 +5746,22 @@ class ChatAgent(BaseAgent):
         content_accumulator: StreamContentAccumulator,
         accumulated_tool_calls: Dict[str, Any],
         tool_call_records: List[ToolCallingRecord],
+        request_token_usage: Dict[str, int],
         step_token_usage: Dict[str, int],
         response_format: Optional[Type[BaseModel]] = None,
-    ) -> AsyncGenerator[Union[ChatAgentResponse, Tuple[bool, bool]], None]:
+    ) -> AsyncGenerator[
+        Union[ChatAgentResponse, Tuple[bool, bool, str]], None
+    ]:
         r"""Async version of process streaming chunks with
         content accumulator.
         """
 
         tool_calls_complete = False
         stream_completed = False
+        last_response_id = ""
 
         async for chunk in stream:
+            last_response_id = getattr(chunk, 'id', '') or last_response_id
             has_choices = bool(chunk.choices and len(chunk.choices) > 0)
 
             # Process chunk delta
@@ -5462,11 +5838,26 @@ class ChatAgent(BaseAgent):
                     # will handle message recording.
                     final_content = content_accumulator.get_full_content()
                     if final_content.strip() and not accumulated_tool_calls:
+                        final_reasoning = (
+                            content_accumulator.get_full_reasoning_content()
+                            or None
+                        )
+
+                        # Extract <think> tags from accumulated
+                        # streaming content when reasoning_content
+                        # is not already set by the model.
+                        final_content, final_reasoning = (
+                            extract_thinking_from_content(
+                                final_content, final_reasoning
+                            )
+                        )
+
                         final_message = BaseMessage(
                             role_name=self.role_name,
                             role_type=self.role_type,
                             meta_dict={},
                             content=final_content,
+                            reasoning_content=final_reasoning,
                         )
 
                         if response_format:
@@ -5480,6 +5871,9 @@ class ChatAgent(BaseAgent):
                 # This happens when stream_options={"include_usage": True}
                 # Update the final usage from this chunk
                 self._update_token_usage_tracker(
+                    request_token_usage, safe_model_dump(chunk.usage)
+                )
+                self._update_token_usage_tracker(
                     step_token_usage, safe_model_dump(chunk.usage)
                 )
 
@@ -5492,6 +5886,16 @@ class ChatAgent(BaseAgent):
                             content_accumulator.get_full_reasoning_content()
                             or None
                         )
+
+                        # Extract <think> tags from accumulated
+                        # streaming content when reasoning_content
+                        # is not already set by the model.
+                        final_content, final_reasoning = (
+                            extract_thinking_from_content(
+                                final_content, final_reasoning
+                            )
+                        )
+
                         # In delta mode, final response content should be empty
                         # since all content was already yielded incrementally
                         display_content = (
@@ -5528,6 +5932,9 @@ class ChatAgent(BaseAgent):
                                 "external_tool_requests": None,
                                 "streaming": False,
                                 "partial": False,
+                                "stream_accumulate_mode": "accumulate"
+                                if self.stream_accumulate
+                                else "delta",
                             },
                         )
                         yield final_response
@@ -5536,7 +5943,7 @@ class ChatAgent(BaseAgent):
                 continue
 
         # Yield the final status as a tuple
-        yield (stream_completed, tool_calls_complete)
+        yield (stream_completed, tool_calls_complete, last_response_id)
 
     async def _execute_tools_async_with_status_accumulator(
         self,
@@ -5548,6 +5955,10 @@ class ChatAgent(BaseAgent):
         r"""Execute multiple tools asynchronously with
         proper content accumulation."""
         import asyncio
+
+        # Record the assistant message with ALL tool calls
+        # Note: _record_assistant_tool_calls_message has early return if empty
+        self._record_assistant_tool_calls_message(accumulated_tool_calls)
 
         # Phase 1: Start all tools and yield "Calling function"
         # statuses immediately
@@ -5676,6 +6087,9 @@ class ChatAgent(BaseAgent):
                 "external_tool_requests": None,
                 "streaming": True,
                 "partial": True,
+                "stream_accumulate_mode": "accumulate"
+                if self.stream_accumulate
+                else "delta",
             },
         )
 
@@ -5760,7 +6174,19 @@ class ChatAgent(BaseAgent):
             tool_execution_timeout=self.tool_execution_timeout,
             pause_event=self.pause_event,
             prune_tool_calls_from_memory=self.prune_tool_calls_from_memory,
-            stream_accumulate=self.stream_accumulate,
+            on_request_usage=self.on_request_usage,
+            stream_accumulate=(
+                self.stream_accumulate
+                if self._stream_accumulate_explicit
+                else None
+            ),
+            summarize_threshold=self.summarize_threshold,
+            mask_tool_output=self.mask_tool_output,
+            enable_snapshot_clean=self._enable_snapshot_clean,
+            retry_attempts=self.retry_attempts,
+            retry_delay=self.retry_delay,
+            step_timeout=self.step_timeout,
+            summary_window_ratio=self.summary_window_ratio,
         )
 
         # Copy memory if requested

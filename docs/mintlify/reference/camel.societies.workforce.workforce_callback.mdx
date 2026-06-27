@@ -30,6 +30,14 @@ Gets a colored message for a log event.
 def log_message(self, event: LogEvent):
 ```
 
+<a id="camel.societies.workforce.workforce_callback.WorkforceCallback.log_stream_chunk"></a>
+
+### log_stream_chunk
+
+```python
+def log_stream_chunk(self, event: StreamChunkEvent):
+```
+
 <a id="camel.societies.workforce.workforce_callback.WorkforceCallback.log_task_created"></a>
 
 ### log_task_created
@@ -60,6 +68,14 @@ def log_task_assigned(self, event: TaskAssignedEvent):
 
 ```python
 def log_task_started(self, event: TaskStartedEvent):
+```
+
+<a id="camel.societies.workforce.workforce_callback.WorkforceCallback.log_task_updated"></a>
+
+### log_task_updated
+
+```python
+def log_task_updated(self, event: TaskUpdatedEvent):
 ```
 
 <a id="camel.societies.workforce.workforce_callback.WorkforceCallback.log_task_completed"></a>

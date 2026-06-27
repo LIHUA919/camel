@@ -23,10 +23,12 @@ class WorkforceEventBase(BaseModel):
     model_config = ConfigDict(frozen=True, extra='forbid')
     event_type: Literal[
         "log",
+        "stream_chunk",
         "task_decomposed",
         "task_created",
         "task_assigned",
         "task_started",
+        "task_updated",
         "task_completed",
         "task_failed",
         "worker_created",
@@ -57,6 +59,14 @@ class LogEvent(WorkforceEventBase):
         ]
         | None
     ) = None
+
+
+class StreamChunkEvent(WorkforceEventBase):
+    event_type: Literal["stream_chunk"] = "stream_chunk"
+    text: str
+    stream_accumulate_mode: str = "accumulate"
+    task_id: Optional[str] = None
+    worker_id: Optional[str] = None
 
 
 class WorkerCreatedEvent(WorkforceEventBase):
@@ -100,6 +110,17 @@ class TaskStartedEvent(WorkforceEventBase):
     worker_id: str
 
 
+class TaskUpdatedEvent(WorkforceEventBase):
+    event_type: Literal["task_updated"] = "task_updated"
+    task_id: str
+    worker_id: Optional[str] = None
+    update_type: Literal["replan", "reassign", "manual"]
+    old_value: Optional[str] = None
+    new_value: Optional[str] = None
+    parent_task_id: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
 class TaskCompletedEvent(WorkforceEventBase):
     event_type: Literal["task_completed"] = "task_completed"
     task_id: str
@@ -132,10 +153,12 @@ class QueueStatusEvent(WorkforceEventBase):
 
 WorkforceEvent = Union[
     LogEvent,
+    StreamChunkEvent,
     TaskDecomposedEvent,
     TaskCreatedEvent,
     TaskAssignedEvent,
     TaskStartedEvent,
+    TaskUpdatedEvent,
     TaskCompletedEvent,
     TaskFailedEvent,
     WorkerCreatedEvent,

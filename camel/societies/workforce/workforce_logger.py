@@ -20,12 +20,14 @@ from camel.societies.workforce.events import (
     AllTasksCompletedEvent,
     LogEvent,
     QueueStatusEvent,
+    StreamChunkEvent,
     TaskAssignedEvent,
     TaskCompletedEvent,
     TaskCreatedEvent,
     TaskDecomposedEvent,
     TaskFailedEvent,
     TaskStartedEvent,
+    TaskUpdatedEvent,
     WorkerCreatedEvent,
     WorkerDeletedEvent,
 )
@@ -39,13 +41,31 @@ logger = get_logger(__name__)
 class WorkforceLogger(WorkforceCallback, WorkforceMetrics):
     r"""Logs events and metrics for a Workforce instance."""
 
-    def __init__(self, workforce_id: str):
+    def __init__(
+        self,
+        workforce_id: str,
+        *,
+        log_stream_chunks: bool = False,
+        stream_chunk_text_limit: Optional[int] = 1000,
+    ):
         """Initializes the WorkforceLogger.
 
         Args:
             workforce_id (str): The unique identifier for the workforce.
+            log_stream_chunks (bool): Whether to persist streaming chunk
+                events. Disabled by default to avoid unbounded in-memory logs
+                for high-volume streams.
+            stream_chunk_text_limit (Optional[int]): Maximum number of
+                characters to store for each stream chunk when
+                `log_stream_chunks` is enabled. Set to `None` to store full
+                chunk text.
         """
+        if stream_chunk_text_limit is not None and stream_chunk_text_limit < 0:
+            raise ValueError("stream_chunk_text_limit must be non-negative")
+
         self.workforce_id: str = workforce_id
+        self.log_stream_chunks: bool = log_stream_chunks
+        self.stream_chunk_text_limit: Optional[int] = stream_chunk_text_limit
         self.log_entries: List[Dict[str, Any]] = []
         self._task_hierarchy: Dict[str, Dict[str, Any]] = {}
         self._worker_information: Dict[str, Dict[str, Any]] = {}
@@ -55,6 +75,32 @@ class WorkforceLogger(WorkforceCallback, WorkforceMetrics):
         r"""Logs a message to the console with color."""
         colored_message = self._get_color_message(event)
         print(colored_message)
+
+    def log_stream_chunk(self, event: StreamChunkEvent) -> None:
+        r"""Logs streaming chunk events."""
+        if not self.log_stream_chunks:
+            return
+
+        text = event.text
+        text_length = len(text)
+        text_truncated = False
+        if (
+            self.stream_chunk_text_limit is not None
+            and text_length > self.stream_chunk_text_limit
+        ):
+            text = text[: self.stream_chunk_text_limit]
+            text_truncated = True
+
+        self._log_event(
+            event_type=event.event_type,
+            text=text,
+            text_length=text_length,
+            text_truncated=text_truncated,
+            stream_accumulate_mode=event.stream_accumulate_mode,
+            task_id=event.task_id,
+            worker_id=event.worker_id,
+            metadata=event.metadata or {},
+        )
 
     def _log_event(self, event_type: str, **kwargs: Any) -> None:
         r"""Internal method to create and store a log entry.
@@ -156,6 +202,21 @@ class WorkforceLogger(WorkforceCallback, WorkforceMetrics):
         )
         if event.task_id in self._task_hierarchy:
             self._task_hierarchy[event.task_id]['status'] = 'processing'
+
+    def log_task_updated(self, event: TaskUpdatedEvent) -> None:
+        r"""Logs updates made to a task."""
+        self._log_event(
+            event_type=event.event_type,
+            task_id=event.task_id,
+            worker_id=event.worker_id,
+            update_type=event.update_type,
+            old_value=event.old_value,
+            new_value=event.new_value,
+            parent_task_id=event.parent_task_id,
+            metadata=event.metadata or {},
+        )
+        if event.task_id in self._task_hierarchy:
+            self._task_hierarchy[event.task_id]['status'] = 'updated'
 
     def log_task_completed(self, event: TaskCompletedEvent) -> None:
         r"""Logs the successful completion of a task."""

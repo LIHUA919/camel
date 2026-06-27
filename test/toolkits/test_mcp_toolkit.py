@@ -15,6 +15,7 @@
 Tests for the refactored MCPToolkit.
 """
 
+import asyncio
 import json
 import tempfile
 from contextlib import asynccontextmanager
@@ -193,16 +194,85 @@ class TestMCPToolkitConnectionManagement:
 
         # Set up the second client to raise an exception during __aenter__
         mock_client2.__aenter__.side_effect = Exception("Connection failed")
+        mock_client2._cleanup_connection = AsyncMock()
 
-        toolkit = MCPToolkit(clients=[mock_client1, mock_client2])
+        toolkit = MCPToolkit(
+            clients=[mock_client1, mock_client2],
+            skip_failed=False,
+            max_retries=1,
+            retry_delay=0,
+        )
 
-        expected_msg = "Failed to connect to client 2"
+        expected_msg = "Failed to connect to 1 MCP server"
         with pytest.raises(MCPConnectionError, match=expected_msg):
             await toolkit.connect()
 
         assert not toolkit._is_connected
         # Verify the first client's __aexit__ was called for cleanup
         mock_client1.__aexit__.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_connect_with_zero_max_retries_attempts_once(self):
+        """max_retries=0 must still make the initial connection attempt."""
+        mock_client = MagicMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+        mock_client.is_connected.return_value = True
+
+        toolkit = MCPToolkit(
+            clients=[mock_client],
+            max_retries=0,
+            retry_delay=0,
+            skip_failed=False,
+        )
+
+        await toolkit.connect()
+
+        assert toolkit._is_connected
+        mock_client.__aenter__.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_connect_zero_max_retries_fails_after_one_attempt(self):
+        """max_retries=0 makes one attempt, then gives up without retrying."""
+        mock_client = MagicMock()
+        mock_client.__aenter__ = AsyncMock(side_effect=RuntimeError("boom"))
+        mock_client._cleanup_connection = AsyncMock()
+        mock_client.is_connected.return_value = False
+
+        toolkit = MCPToolkit(
+            clients=[mock_client],
+            max_retries=0,
+            retry_delay=0,
+            skip_failed=False,
+        )
+
+        with pytest.raises(MCPConnectionError):
+            await toolkit.connect()
+
+        # Exactly one attempt even though max_retries=0.
+        assert mock_client.__aenter__.await_count == 1
+        mock_client._cleanup_connection.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_max_retries_counts_retries_after_first_attempt(self):
+        """max_retries counts retries after the first attempt."""
+        mock_client = MagicMock()
+        mock_client.__aenter__ = AsyncMock(side_effect=RuntimeError("boom"))
+        mock_client._cleanup_connection = AsyncMock()
+        mock_client.is_connected.return_value = False
+
+        toolkit = MCPToolkit(
+            clients=[mock_client],
+            max_retries=2,
+            retry_delay=0,
+            skip_failed=False,
+        )
+
+        with pytest.raises(MCPConnectionError):
+            await toolkit.connect()
+
+        # 1 initial attempt + 2 retries.
+        assert mock_client.__aenter__.await_count == 3
 
     @pytest.mark.asyncio
     async def test_connect_already_connected(self):
@@ -283,11 +353,92 @@ class TestMCPToolkitConnectionManagement:
 
         # Mark as connected
         toolkit._is_connected = True
+        toolkit._connected_clients = [mock_client1, mock_client2]
         assert toolkit.is_connected
 
         # One client disconnected
         mock_client2.is_connected.return_value = False
+        assert toolkit.is_connected
+
+        # No connected clients remain
+        mock_client1.is_connected.return_value = False
         assert not toolkit.is_connected
+
+    @pytest.mark.asyncio
+    async def test_connect_skip_failed_keeps_toolkit_usable(self):
+        """A partial connect should still leave the toolkit usable."""
+        mock_client1 = MagicMock()
+        mock_client2 = MagicMock()
+
+        mock_tool = MagicMock()
+        mock_tool.func.__name__ = "tool1"
+
+        mock_client1.__aenter__.return_value = mock_client1
+        mock_client1.__aexit__.return_value = None
+        mock_client1.is_connected.return_value = True
+        mock_client1.get_tools.return_value = [mock_tool]
+        mock_client1.call_tool = AsyncMock(return_value="tool result")
+
+        mock_client2.__aenter__.side_effect = Exception("Connection failed")
+        mock_client2._cleanup_connection = AsyncMock()
+        mock_client2.is_connected.return_value = False
+        mock_client2.get_tools.side_effect = RuntimeError("not connected")
+
+        toolkit = MCPToolkit(
+            clients=[mock_client1, mock_client2],
+            max_retries=1,
+            retry_delay=0,
+        )
+
+        await toolkit.connect()
+
+        assert toolkit.is_connected
+        assert (
+            await toolkit.call_tool("tool1", {"arg": "value"}) == "tool result"
+        )
+
+    @pytest.mark.asyncio
+    async def test_connect_propagates_cancellation(self):
+        """Cancellation should not be converted into a retry loop."""
+        mock_client = MagicMock()
+        started = asyncio.Event()
+
+        async def slow_enter():
+            started.set()
+            await asyncio.sleep(10)
+
+        mock_client.__aenter__.side_effect = slow_enter
+        mock_client._cleanup_connection = AsyncMock()
+
+        toolkit = MCPToolkit(
+            clients=[mock_client],
+            max_retries=2,
+            retry_delay=0,
+            per_client_timeout=30,
+        )
+
+        task = asyncio.create_task(toolkit.connect())
+        await started.wait()
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        mock_client._cleanup_connection.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_connect_all_clients_propagates_cancelled_subtask(self):
+        """A cancelled child task should not be counted as success."""
+        toolkit = MCPToolkit(clients=[MagicMock()])
+
+        async def cancelled_client(*args, **kwargs):
+            raise asyncio.CancelledError()
+
+        with patch.object(
+            toolkit, "_connect_single_client", side_effect=cancelled_client
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await toolkit._connect_all_clients()
 
     @pytest.mark.asyncio
     async def test_context_manager(self):
@@ -337,6 +488,41 @@ class TestMCPToolkitFactoryMethods:
 
                     assert result is toolkit
                     assert toolkit._is_connected
+
+    @pytest.mark.asyncio
+    async def test_create_forwards_robust_connect_options(self):
+        """Factory method should forward the new connection controls."""
+        with patch.object(
+            MCPToolkit, '__init__', return_value=None
+        ) as init_mock:
+            toolkit = MCPToolkit.__new__(MCPToolkit)
+            toolkit.disconnect = AsyncMock()
+
+            async def mock_connect():
+                return toolkit
+
+            toolkit.connect = mock_connect
+
+            patch_path = 'camel.toolkits.mcp_toolkit.MCPToolkit.__new__'
+            with patch(patch_path, return_value=toolkit):
+                await MCPToolkit.create(
+                    clients=[],
+                    skip_failed=False,
+                    per_client_timeout=12,
+                    max_retries=4,
+                    retry_delay=0.5,
+                )
+
+        init_mock.assert_called_once_with(
+            clients=[],
+            config_path=None,
+            config_dict=None,
+            timeout=None,
+            skip_failed=False,
+            per_client_timeout=12,
+            max_retries=4,
+            retry_delay=0.5,
+        )
 
     @pytest.mark.asyncio
     async def test_create_failure_cleanup(self):

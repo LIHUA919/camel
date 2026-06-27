@@ -57,6 +57,12 @@ class ZhipuAIConfig(BaseConfig):
             forces the model to call that tool. :obj:`"none"` is the default
             when no tools are present. :obj:`"auto"` is the default if tools
             are present.
+        interleaved_thinking (Optional[bool], optional): Whether to enable
+            interleaved thinking mode for GLM-4.5+ models. When enabled, the
+            model reasons before each response and tool call.
+            (default: :obj:`None`)
+        reasoning_effort (str, optional): Controls reasoning depth for GLM-5.2.
+            Supported values are provider-defined. (default: :obj:`None`)
     """
 
     temperature: Optional[float] = None
@@ -67,6 +73,8 @@ class ZhipuAIConfig(BaseConfig):
     tool_choice: Optional[
         Union[Dict[str, Union[str, Dict[str, str]]], str]
     ] = None
+    interleaved_thinking: Optional[bool] = None
+    reasoning_effort: Optional[str] = None
 
 
 ZHIPUAI_API_PARAMS = {param for param in ZhipuAIConfig.model_fields.keys()}

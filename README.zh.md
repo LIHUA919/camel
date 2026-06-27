@@ -245,6 +245,22 @@ pip install camel-ai
   # [https://github.com/camel-ai/camel](https://github.com/camel-ai/camel).
   ```
 
+4. **（可选）开启模型请求/响应日志：**
+
+  ```bash
+  export CAMEL_MODEL_LOG_ENABLED=true
+  export CAMEL_MODEL_LOG_MODEL_CONFIG_ENABLED=true
+  export CAMEL_LOG_DIR=camel_logs
+  ```
+
+  - `CAMEL_MODEL_LOG_ENABLED`：开启请求/响应 JSON 日志。
+  - `CAMEL_MODEL_LOG_MODEL_CONFIG_ENABLED`：控制是否记录
+    `request.model_config_dict`。未设置时，默认跟
+    `CAMEL_MODEL_LOG_ENABLED` 保持一致。
+  - `CAMEL_LOG_DIR`：日志输出目录（默认：`camel_logs`）。
+  - 日志以 UTF-8 JSON 写入，中文、日文、阿拉伯语等多语言内容可读，
+    不会出现大量 Unicode 转义字符。
+
 有关更详细的说明和其他配置选项，请参阅[安装部分](https://github.com/camel-ai/camel/blob/master/docs/get_started/installation.md)。
 
 运行之后，您可以访问 [docs.camel-ai.org](https://docs.camel-ai.org) 探索我们的 CAMEL 技术栈和操作手册，构建强大的多智能体系统。
@@ -255,7 +271,6 @@ pip install camel-ai
 
 - **[创建你的第一个 Agent](https://docs.camel-ai.org/cookbooks/basic_concepts/create_your_first_agent)**
 - **[创建你的第一个 Agent 社区](https://docs.camel-ai.org/cookbooks/basic_concepts/create_your_first_agents_society)**
-- **[具身智能体](https://docs.camel-ai.org/cookbooks/advanced_features/embodied_agents)**
 - **[评审智能体](https://docs.camel-ai.org/cookbooks/advanced_features/critic_agents_and_tree_search)**
 
 ### 寻求帮助
@@ -489,7 +504,7 @@ pip install camel-ai
 我们还要感谢 Haya Hammoud 设计了我们项目的初始徽标。
 
 我们实现了来自其他研究工作的优秀创意，供您构建、比较和定制智能体。如果您使用了其中的任何模块，请务必引用原始作品：
-- `TaskCreationAgent`, `TaskPrioritizationAgent` and `BabyAGI` from *Nakajima et al.*: [Task-Driven Autonomous Agent](https://yoheinakajima.com/task-driven-autonomous-agent-utilizing-gpt-4-pinecone-and-langchain-for-diverse-applications/). [[Example](https://github.com/camel-ai/camel/blob/master/examples/ai_society/babyagi_playing.py)]
+- `TaskCreationAgent` and `TaskPrioritizationAgent` from *Nakajima et al.*: [Task-Driven Autonomous Agent](https://yoheinakajima.com/task-driven-autonomous-agent-utilizing-gpt-4-pinecone-and-langchain-for-diverse-applications/).
 
 - `PersonaHub` from *Tao Ge et al.*: [Scaling Synthetic Data Creation with 1,000,000,000 Personas](https://arxiv.org/pdf/2406.20094). [[Example](https://github.com/camel-ai/camel/blob/master/examples/personas/personas_generation.py)]
 

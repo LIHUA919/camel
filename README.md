@@ -290,6 +290,24 @@ This example demonstrates how to create a `ChatAgent` using the CAMEL framework 
   # [https://github.com/camel-ai/camel](https://github.com/camel-ai/camel).
   ```
 
+4. **(Optional) Enable model request/response logs:**
+
+  ```bash
+  export CAMEL_MODEL_LOG_ENABLED=true
+  export CAMEL_MODEL_LOG_MODEL_CONFIG_ENABLED=true
+  export CAMEL_LOG_DIR=camel_logs
+  ```
+
+  - `CAMEL_MODEL_LOG_ENABLED`: Enables request/response JSON logs.
+  - `CAMEL_MODEL_LOG_MODEL_CONFIG_ENABLED`: Controls whether
+    `model_config_dict` is logged under `request.model_config_dict`.
+    When unset, it defaults to the same value as
+    `CAMEL_MODEL_LOG_ENABLED`.
+  - `CAMEL_LOG_DIR`: Directory for generated log files
+    (default: `camel_logs`).
+  - Logs are written as UTF-8 JSON with multilingual text preserved
+    (for example Chinese, Japanese, Arabic) without Unicode escape noise.
+
 
 For more detailed instructions and additional configuration options, check out the [installation section](https://github.com/camel-ai/camel/blob/master/docs/get_started/installation.md).
 
@@ -301,7 +319,6 @@ Explore different types of agents, their roles, and their applications.
 
 - **[Creating Your First Agent](https://docs.camel-ai.org/cookbooks/basic_concepts/create_your_first_agent)**
 - **[Creating Your First Agent Society](https://docs.camel-ai.org/cookbooks/basic_concepts/create_your_first_agents_society)**
-- **[Embodied Agents](https://docs.camel-ai.org/cookbooks/advanced_features/embodied_agents)**
 - **[Critic Agents](https://docs.camel-ai.org/cookbooks/advanced_features/critic_agents_and_tree_search)**
 
 ### Seeking Help
@@ -562,7 +579,7 @@ Special thanks to [Nomic AI](https://home.nomic.ai/) for giving us extended acce
 We would also like to thank Haya Hammoud for designing the initial logo of our project.
 
 We implemented amazing research ideas from other works for you to build, compare and customize your agents. If you use any of these modules, please kindly cite the original works:
-- `TaskCreationAgent`, `TaskPrioritizationAgent` and `BabyAGI` from *Nakajima et al.*: [Task-Driven Autonomous Agent](https://yoheinakajima.com/task-driven-autonomous-agent-utilizing-gpt-4-pinecone-and-langchain-for-diverse-applications/). [[Example](https://github.com/camel-ai/camel/blob/master/examples/ai_society/babyagi_playing.py)]
+- `TaskCreationAgent` and `TaskPrioritizationAgent` from *Nakajima et al.*: [Task-Driven Autonomous Agent](https://yoheinakajima.com/task-driven-autonomous-agent-utilizing-gpt-4-pinecone-and-langchain-for-diverse-applications/).
 
 - `PersonaHub` from *Tao Ge et al.*: [Scaling Synthetic Data Creation with 1,000,000,000 Personas](https://arxiv.org/pdf/2406.20094). [[Example](https://github.com/camel-ai/camel/blob/master/examples/personas/personas_generation.py)]
 

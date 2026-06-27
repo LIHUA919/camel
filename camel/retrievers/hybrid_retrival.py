@@ -11,11 +11,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ========= Copyright 2023-2026 @ CAMEL-AI.org. All Rights Reserved. =========
-from typing import Any, Collection, Dict, List, Optional, Sequence, Union
+from typing import Any, Dict, List, Optional, Union
 
 from camel.embeddings import BaseEmbedding
 from camel.retrievers import BaseRetriever, BM25Retriever, VectorRetriever
+from camel.retrievers.base_rerank import BaseRerankRetriever
 from camel.storages import BaseVectorStorage
+from camel.utils import dependencies_required
 
 
 class HybridRetriever(BaseRetriever):
@@ -54,6 +56,7 @@ class HybridRetriever(BaseRetriever):
         self.vr.process(content=self.content_input_path)
         self.bm25.process(content_input_path=self.content_input_path)
 
+    @dependencies_required('numpy')
     def _sort_rrf_scores(
         self,
         vector_retriever_results: List[Dict[str, Any]],
@@ -161,10 +164,9 @@ class HybridRetriever(BaseRetriever):
         vector_retriever_similarity_threshold: float = 0.5,
         bm25_retriever_top_k: int = 50,
         return_detailed_info: bool = False,
-    ) -> Union[
-        dict[str, Sequence[Collection[str]]],
-        dict[str, Sequence[Union[str, float]]],
-    ]:
+        reranker: Optional[BaseRerankRetriever] = None,
+        rerank_input_top_k: int = 50,
+    ) -> Dict[str, Any]:
         r"""Executes a hybrid retrieval query using both vector and BM25
         retrievers.
 
@@ -179,6 +181,15 @@ class HybridRetriever(BaseRetriever):
                 threshold for vector retriever.
             bm25_retriever_top_k (int): Top results from BM25 retriever.
             return_detailed_info (bool): Return detailed info if True.
+            reranker (Optional[BaseRerankRetriever]): An optional re-ranking
+                retriever (e.g. :class:`CohereRerankRetriever` or
+                :class:`JinaRerankRetriever`). When provided, the fused
+                results are re-ordered by the reranker before being truncated
+                to ``top_k``, forming a retrieve -> fuse -> rerank pipeline.
+                (default: :obj:`None`)
+            rerank_input_top_k (int): The number of top fused candidates fed
+                into the reranker. Only used when ``reranker`` is provided.
+                (default: :obj:`50`)
 
         Returns:
             Union[
@@ -217,14 +228,27 @@ class HybridRetriever(BaseRetriever):
             top_k=bm25_retriever_top_k,
         )
 
+        # When a reranker is used, fuse a larger candidate pool first and let
+        # the reranker decide the final top_k ordering.
+        fusion_top_k = (
+            max(top_k, rerank_input_top_k) if reranker is not None else top_k
+        )
+
         all_retrieved_info = self._sort_rrf_scores(
             vector_retriever_results,
             bm25_retriever_results,
-            top_k,
+            fusion_top_k,
             vector_weight,
             bm25_weight,
             rank_smoothing_factor,
         )
+
+        if reranker is not None and all_retrieved_info:
+            all_retrieved_info = reranker.query(
+                query=query,
+                retrieved_result=all_retrieved_info,  # type: ignore[arg-type]
+                top_k=top_k,
+            )
 
         retrieved_info = {
             "Original Query": query,
@@ -234,4 +258,4 @@ class HybridRetriever(BaseRetriever):
                 else [item['text'] for item in all_retrieved_info]  # type: ignore[misc]
             ),
         }
-        return retrieved_info
+        return retrieved_info  # type: ignore[return-value]

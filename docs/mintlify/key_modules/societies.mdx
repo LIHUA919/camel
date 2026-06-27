@@ -2,6 +2,9 @@
 title: "Societies"
 description: "Collaborative agent frameworks in CAMEL: autonomous social behaviors, role-based task solving, and turn-based agent societies."
 icon: people-group
+
+doc_code_map:
+  - "camel/societies/**/*.py"
 ---
 
 <Note type="info" title="What is the Society Module?">
@@ -165,7 +168,6 @@ if __name__ == "__main__":
     <ul>
       <li>Use <b>RolePlaying</b> for most multi-agent conversations, with or without a critic.</li>
       <li>Define specific roles and prompt-guardrails for your agents—structure is everything!</li>
-      <li>Try <b>BabyAGI</b> when you want open-ended, research-oriented, or autonomous projects.</li>
       <li>Leverage the <code>with_task_specify</code> and <code>with_task_planner</code> options for highly complex tasks.</li>
       <li>Monitor for infinite loops—every agent response should have a clear next step or end.</li>
     </ul>
